@@ -1,0 +1,5 @@
+# Run logs written next to the scripts
+*.log
+
+# Never track the distro disk image (it lives in ~\WSL\openclaw, but guard anyway)
+*.vhdx

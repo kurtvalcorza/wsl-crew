@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Repoints OpenClaw's ollama provider at the current Windows host IP.
+# The WSL NAT gateway IP (e.g. 172.30.32.1) can change across reboots, which would
+# silently break the local fallback model. Safe + idempotent - run anytime.
+set -euo pipefail
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+
+HOST_IP="$(ip route show default | sed -n 's/.*via \([0-9.]*\).*/\1/p' | head -n1)"
+[ -n "$HOST_IP" ] || { echo "ERROR: could not determine host IP"; exit 1; }
+WANT="http://${HOST_IP}:11434"
+
+CUR="$(openclaw config get models.providers.ollama.baseUrl 2>/dev/null | tr -d '"[:space:]' || true)"
+echo "host IP now : $HOST_IP"
+echo "config has  : ${CUR:-<unset>}"
+
+if ! curl -s -o /dev/null --max-time 6 "${WANT}/api/version"; then
+  echo "WARNING: $WANT is not answering."
+  echo "  - is Ollama running on Windows?"
+  echo "  - is OLLAMA_HOST=0.0.0.0 set (else it binds 127.0.0.1 and WSL cannot reach it)?"
+  echo "  - firewall rule 'Ollama for OpenClaw WSL (11434)' present for this subnet?"
+fi
+
+if [ "$CUR" = "$WANT" ]; then
+  echo "already correct - nothing to do."
+  exit 0
+fi
+
+printf '%s' "{ models: { providers: { ollama: { baseUrl: \"${WANT}\" } } } }" \
+  | openclaw config patch --stdin
+echo "updated baseUrl -> $WANT"
+echo "restarting gateway..."
+systemctl --user restart openclaw-gateway.service
+echo "done."
