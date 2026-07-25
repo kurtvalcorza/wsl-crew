@@ -1,0 +1,8 @@
+# Windows-side scripts want CRLF
+*.ps1  text eol=crlf
+*.vbs  text eol=crlf
+*.md   text eol=crlf
+
+# The in-distro bash helper MUST keep LF, or bash fails with $'\r' errors
+distro/fix-ollama-baseurl text eol=lf
+*.sh   text eol=lf
