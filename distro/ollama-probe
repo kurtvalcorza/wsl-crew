@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Probes the host Ollama from inside the distro and prints a single machine-readable line:
+#   OK <version>        - reachable
+#   FAIL <reason>       - not reachable
+#
+# This exists as a FILE on purpose. Inlining the host-IP lookup into `wsl.exe ... bash -lc "..."`
+# from PowerShell mangles the embedded quotes/backslashes (bash then dies with
+# "unexpected EOF while looking for matching ')'"), which produced a false UNREACHABLE in the tray.
+set -uo pipefail
+
+HOST_IP="$(ip route show default | sed -n 's/.*via \([0-9.]*\).*/\1/p' | head -n1)"
+if [ -z "$HOST_IP" ]; then
+  echo "FAIL no-default-route"
+  exit 1
+fi
+
+BODY="$(curl -s --max-time 6 "http://${HOST_IP}:11434/api/version" 2>/dev/null)"
+if [ -z "$BODY" ]; then
+  echo "FAIL no-response-from-${HOST_IP}:11434"
+  exit 1
+fi
+
+VER="$(printf '%s' "$BODY" | sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p')"
+if [ -n "$VER" ]; then
+  echo "OK ${VER} via ${HOST_IP}"
+  exit 0
+fi
+
+echo "FAIL unexpected-response ${BODY}"
+exit 1

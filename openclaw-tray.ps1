@@ -36,6 +36,38 @@ function Notify($title, $text, $level) {
   Write-Log "$title - $text"
 }
 
+# Probes the host Ollama from inside the distro. Returns "OK <ver> via <ip>" or "FAIL <reason>".
+# Calls a SCRIPT FILE in the distro on purpose: inlining the host-IP lookup here means embedded
+# quotes/backslashes get mangled crossing wsl.exe and bash dies -- which read as a false
+# "UNREACHABLE" in an earlier version of this app.
+function Test-Ollama {
+  try {
+    $out = & wsl.exe -d $Distro -u kurt -e bash -lc '$HOME/bin/ollama-probe' 2>&1
+    $txt = ($out | Out-String).Trim()
+    if ([string]::IsNullOrWhiteSpace($txt)) { return 'FAIL no-output' }
+    return ($txt -split "`n" | Select-Object -Last 1).Trim()
+  } catch { return "FAIL $($_.Exception.Message)" }
+}
+
+# Restarts the host Ollama with OLLAMA_HOST=0.0.0.0 so the WSL distro can reach it.
+# Setting the User env var alone is not enough for an already-running app: child processes inherit
+# the launching shell's environment, not the registry. So set it in-session and relaunch.
+function Start-OllamaBound {
+  try {
+    Get-Process ollama, 'ollama app' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    [Environment]::SetEnvironmentVariable('OLLAMA_HOST','0.0.0.0','User')   # persist for next logon
+    $env:OLLAMA_HOST = '0.0.0.0'                                           # and for the child we spawn
+    $app = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama app.exe'
+    $exe = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'
+    if (Test-Path $app)     { Start-Process $app }
+    elseif (Test-Path $exe) { Start-Process $exe -ArgumentList 'serve' -WindowStyle Hidden }
+    else { Write-Log 'Start-OllamaBound: no ollama executable found'; return }
+    Start-Sleep -Seconds 12
+    Write-Log 'Start-OllamaBound: relaunched with OLLAMA_HOST=0.0.0.0'
+  } catch { Write-Log "Start-OllamaBound error: $($_.Exception.Message)" }
+}
+
 # ---------- job 1: LAN access (elevates) ----------
 function Repair-Lan {
   Notify 'Fixing LAN access' 'Approve the admin prompt...' 'Info'
@@ -57,13 +89,35 @@ function Repair-Lan {
 function Repair-Ollama {
   Notify 'Fixing local model' 'Re-pointing Ollama provider...' 'Info'
   try {
+    # Step 1: is the host Ollama actually serving on a WSL-reachable address?
+    # A stopped Ollama -- or one bound to 127.0.0.1 -- cannot be fixed by re-pointing baseUrl.
+    if ((Test-Ollama) -notmatch '^OK') {
+      $listening = @(Get-NetTCPConnection -LocalPort 11434 -State Listen -ErrorAction SilentlyContinue)
+      $loopbackOnly = ($listening.Count -gt 0) -and
+                      (@($listening | Where-Object { $_.LocalAddress -in @('0.0.0.0','::') }).Count -eq 0)
+
+      if ($listening.Count -eq 0) {
+        Notify 'Starting Ollama' 'Ollama is not listening on the host - starting it.' 'Info'
+        Start-OllamaBound
+      } elseif ($loopbackOnly) {
+        Notify 'Rebinding Ollama' 'Ollama is bound to 127.0.0.1 only - restarting it so WSL can reach it.' 'Info'
+        Start-OllamaBound
+      }
+    }
+
+    # Step 2: repair a drifted host IP in OpenClaw's config (no-op if unchanged).
     $out = & wsl.exe -d $Distro -u kurt -e bash -lc '$HOME/bin/fix-ollama-baseurl' 2>&1
     $txt = ($out | Out-String).Trim()
     Write-Log "fix-ollama-baseurl output: $txt"
-    if ($txt -match 'already correct') { Notify 'Local model OK' 'Ollama baseUrl was already correct.' 'Info' }
-    elseif ($txt -match 'updated baseUrl') { Notify 'Local model fixed' 'baseUrl updated and gateway restarted.' 'Info' }
-    elseif ($txt -match 'WARNING|ERROR') { Notify 'Local model needs attention' (($txt -split "`n" | Select-Object -First 3) -join ' ') 'Warning' }
-    else { Notify 'Local model' (($txt -split "`n" | Select-Object -Last 1)) 'Info' }
+
+    # Step 3: report what is ACTUALLY true now, not what step 2 printed.
+    $probe = Test-Ollama
+    if ($probe -match '^OK') {
+      if ($txt -match 'updated baseUrl') { Notify 'Local model fixed' "baseUrl updated, gateway restarted. $probe" 'Info' }
+      else { Notify 'Local model OK' $probe 'Info' }
+    } else {
+      Notify 'Local model still unreachable' "$probe -- check that Ollama is running on Windows and OLLAMA_HOST=0.0.0.0" 'Warning'
+    }
   } catch { Notify 'Ollama fix error' $_.Exception.Message 'Error' }
 }
 
@@ -77,8 +131,8 @@ function Show-Status {
   $lan = (& curl.exe -s -o NUL -w '%{http_code}' --max-time 12 "http://${LanIp}:${Port}/" 2>&1)
   $lines += if ($lan -eq '200') { 'LAN access   : OK' } else { "LAN access   : BROKEN (http $lan) - run Fix LAN access" }
 
-  $ver = & wsl.exe -d $Distro -u kurt -e bash -lc 'curl -s --max-time 6 http://$(ip route show default | sed -n "s/.*via \([0-9.]*\).*/\1/p" | head -n1):11434/api/version' 2>&1
-  $lines += if (($ver | Out-String) -match '"version"') { 'Local model  : OK' } else { 'Local model  : UNREACHABLE - run Fix local model' }
+  $probe = Test-Ollama
+  $lines += if ($probe -match '^OK') { "Local model  : OK ($probe)" } else { "Local model  : UNREACHABLE ($probe) - run Fix local model" }
 
   $body = ($lines -join "`r`n")
   Write-Log ("status: " + ($lines -join ' | '))
