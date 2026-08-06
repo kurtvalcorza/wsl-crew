@@ -1,11 +1,12 @@
 #Requires -RunAsAdministrator
-# Lets the "openclaw" WSL distro reach the HOST Ollama at 11434.
+# Lets the WSL distro reach the HOST Ollama at 11434.
 # Ollama defaults to 127.0.0.1 which WSL cannot reach, so we bind 0.0.0.0 -- but the firewall
 # rule below scopes inbound 11434 to the WSL subnet ONLY, so it is NOT exposed to the LAN.
 $ErrorActionPreference = 'Continue'
-$Port      = 11434
-$WslSubnet = '172.30.32.0/20'   # vEthernet (WSL) network
-$LogPath   = 'C:\Users\Kurt Valcorza\WSL\openclaw\ollama-expose-last-run.log'
+. (Join-Path $PSScriptRoot 'config.local.ps1')
+
+$Port    = 11434
+$LogPath = Join-Path $PSScriptRoot 'ollama-expose-last-run.log'
 
 function Log($m) { Write-Host $m; Add-Content -Path $LogPath -Value $m }
 Set-Content -Path $LogPath -Value "Ollama expose-to-WSL run $(Get-Date -Format o)"

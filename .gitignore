@@ -1,5 +1,8 @@
 # Run logs written next to the scripts
 *.log
 
+# Local config with real values (copy config.example.ps1 to config.local.ps1)
+config.local.ps1
+
 # Never track the distro disk image (it lives in ~\WSL\openclaw, but guard anyway)
 *.vhdx

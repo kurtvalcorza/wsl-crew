@@ -8,4 +8,4 @@
 ' UPDATE the distro name and user below to match your setup.
 ' Window style 0 = hidden, False = don't wait.
 Set shell = CreateObject("WScript.Shell")
-shell.Run "wsl.exe -d openclaw -u kurt --exec /bin/sleep infinity", 0, False
+shell.Run "wsl.exe -d kirocrew -u kurt --exec /bin/sleep infinity", 0, False

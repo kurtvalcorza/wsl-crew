@@ -1,0 +1,24 @@
+# KiroCrew Gateway - systemd user service
+# Install: cp kirocrew-gateway.service ~/.config/systemd/user/
+#          systemctl --user daemon-reload && systemctl --user enable kirocrew-gateway.service
+#
+# Adjust paths and UID below to match your distro. Find your UID with: id -u
+
+[Unit]
+Description=KiroCrew Gateway
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/KiroCrew
+ExecStart=%h/KiroCrew/.venv/bin/python3.12 %h/.local/bin/kirocrew gateway
+Restart=on-failure
+RestartSec=5
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Replace 1001 with your UID (id -u)
+Environment=XDG_RUNTIME_DIR=/run/user/1001
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus
+
+[Install]
+WantedBy=default.target
