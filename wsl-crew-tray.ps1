@@ -128,8 +128,16 @@ function Get-VmmemInfo {
 function Test-Ollama {
   # `wsl -d <distro> ...` STARTS a stopped distro as a side effect. A read-only status check
   # must not resurrect one the user deliberately stopped via Stop distro, so bail out first.
-  # Only a definite $false skips: on unknown we probe, preferring a stale answer to none.
-  if ((Test-DistroRunning $Distro) -eq $false) { return "SKIP $Distro-stopped" }
+  #
+  # Probe ONLY on a definite $true. An earlier version skipped only on a definite $false,
+  # reasoning that an unknown state should still be probed for a possibly-stale answer --
+  # but that left a transient probe failure able to restart a stopped distro, which is the
+  # exact side effect this guard exists to prevent. For a read-only check, "I don't know"
+  # is a better answer than an unrequested VM start.
+  $state = Test-DistroRunning $Distro
+  if ($state -ne $true) {
+    return "SKIP $Distro-$(if ($null -eq $state) { 'state-unknown' } else { 'stopped' })"
+  }
   try {
     $out = & wsl.exe -d $Distro -u $OpenClawUser -e bash -lc '$HOME/bin/ollama-probe' 2>&1
     $txt = ($out | Out-String).Trim()
@@ -225,6 +233,7 @@ function Show-Status {
 
   $probe = Test-Ollama
   $lines += if ($probe -match '^OK') { "Local model  : OK ($probe)" }
+            elseif ($probe -match 'state-unknown') { "Local model  : not checked - could not tell whether '$Distro' is running" }
             elseif ($probe -match '^SKIP') { "Local model  : not checked - '$Distro' is stopped" }
             else { "Local model  : UNREACHABLE ($probe) - run Fix local model" }
 
