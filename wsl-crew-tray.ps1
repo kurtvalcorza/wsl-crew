@@ -40,38 +40,77 @@ function Notify($title, $text, $level) {
   Write-Log "$title - $text"
 }
 
+# Runs wsl.exe and returns its stdout correctly decoded, plus a real exit code.
+# Returns $null if the process could not be started at all.
+#
+# Deleting NUL bytes from the misdecoded output is an ASCII-ONLY reconstruction and was
+# wrong: for a distro named "dev-<CJK>", the UTF-16LE bytes 8B 95 7A 76 do not survive being
+# read as single bytes -- verified, they come back as U+FFFD U+FFFD 'z' 'v', so the name can
+# never be matched, and such a distro could be neither shown as running nor stopped from the
+# menu. The bytes must be decoded, not repaired.
+#
+# stdout is captured through Latin-1, which maps bytes 1:1 onto U+0000-U+00FF and so hands
+# the raw bytes back intact, letting the real encoding be chosen here. WSL_UTF8 is forced on
+# so the encoding does not depend on whatever the user happens to have in their environment,
+# and the NUL sniff still covers a WSL old enough to ignore that variable and emit UTF-16LE.
+function Invoke-WslCapture {
+  param([Parameter(Mandatory)][string]$ArgLine)
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName               = 'wsl.exe'
+    $psi.Arguments              = $ArgLine
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::GetEncoding(28591)  # Latin-1
+    $psi.UseShellExecute        = $false
+    $psi.CreateNoWindow         = $true
+    [void]$psi.EnvironmentVariables.Remove('WSL_UTF8')
+    [void]$psi.EnvironmentVariables.Add('WSL_UTF8', '1')
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $rawChars = $proc.StandardOutput.ReadToEnd()
+    [void]$proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+
+    $bytes = New-Object byte[] $rawChars.Length
+    for ($i = 0; $i -lt $rawChars.Length; $i++) { $bytes[$i] = [byte][int]$rawChars[$i] }
+
+    # A UTF-16LE payload of mostly-ASCII text is roughly half NUL bytes; UTF-8 has none.
+    $zeros = 0; foreach ($b in $bytes) { if ($b -eq 0) { $zeros++ } }
+    $enc = if ($bytes.Length -gt 0 -and $zeros -gt 0) { [System.Text.Encoding]::Unicode }
+           else { [System.Text.Encoding]::UTF8 }
+
+    return [pscustomobject]@{
+      Text     = $enc.GetString($bytes).TrimStart([char]0xFEFF)   # drop any BOM
+      ExitCode = $proc.ExitCode
+    }
+  } catch {
+    Write-Log "Invoke-WslCapture failed for '$ArgLine': $($_.Exception.Message)"
+    return $null
+  }
+}
+
 # Returns an ARRAY of exact running-distro names, or $null if the probe itself failed.
 # $null and @() are deliberately different: @() means "nothing is running", $null means "we
-# do not know". No caller may collapse the second into the first.
+# do not know". No caller may collapse the second into the first -- doing so is what let a
+# stopped distro read as "unknown", and what let a failed probe restart one.
 #
-# Three traps this works around:
-#   1. wsl.exe emits UTF-16LE. Windows PowerShell 5.1 -- which is what
-#      launchers\wsl-crew-tray.vbs starts this app with -- decodes that as NUL-interleaved
-#      text, so "kirocrew" arrives as "k`0i`0r`0o`0c`0r`0e`0w" and a naive -match NEVER
-#      fires. That silently made the guard in Repair-KiroCrew always believe the distro was
-#      down, so every click spawned another redundant `sleep infinity` keepalive.
-#   2. wsl.exe signals failure through its exit code, NOT an exception, so a try/catch alone
-#      never sees it -- a failed probe would look like an empty list.
-#   3. Substring matching confuses distro names that share a prefix: `rancher-desktop` would
-#      read as running whenever only `rancher-desktop-data` is. Hence exact names, compared
-#      with -eq by callers, rather than one joined string.
+# Encoding and exit-code handling both live in Invoke-WslCapture above. What remains here:
+# names are returned verbatim and compared with -eq by callers, never by substring, because
+# `rancher-desktop` would otherwise read as running whenever only `rancher-desktop-data` is.
 function Get-RunningDistros {
-  $raw = $null
-  try {
-    $raw = (& wsl.exe --list --running --quiet 2>&1 | Out-String)
-  } catch {
-    Write-Log "Get-RunningDistros threw: $($_.Exception.Message)"
+  $res = Invoke-WslCapture '--list --running --quiet'
+  if ($null -eq $res) { return $null }
+  if ($res.ExitCode -ne 0) {
+    Write-Log "Get-RunningDistros: wsl.exe exited $($res.ExitCode)"
     return $null
   }
-  if ($LASTEXITCODE -ne 0) {
-    Write-Log "Get-RunningDistros: wsl.exe exited $LASTEXITCODE"
-    return $null
-  }
+  $raw = $res.Text
   # The unary comma is load-bearing. `return @(...)` enumerates into the pipeline, so an
   # EMPTY array arrives at the caller as $null -- which would collapse "nothing is running"
   # back into "unknown" and defeat the whole tristate below. Verified with zero distros up:
   # `return @()` gives $null, `return ,@()` gives a real 0-count array.
-  return ,@(($raw -replace "`0", '') -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  return ,@($raw -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
 
 # True when a `sleep infinity` keepalive already holds this distro open.
