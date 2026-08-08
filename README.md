@@ -19,6 +19,7 @@ Right-click the tray icon:
 | **Open KiroCrew dashboard** | Generates a fresh auth token and opens the browser |
 | **Open OpenClaw dashboard** | Opens the local gateway URL |
 | **Restart KiroCrew gateway** | Starts the distro if needed, restarts the systemd service, verifies health |
+| **Stop distro ▸** | Terminates OpenClaw or KiroCrew to reclaim its memory. Entries show live state and grey out when already stopped |
 | **Fix LAN access (admin)** | Updates the portproxy rule to the distro's current IP |
 | **Fix local model (Ollama)** | Re-points your service's Ollama config at the current host IP |
 | **Check status** | Probes all services and shows a summary |
@@ -106,7 +107,27 @@ Three layers keep your services alive:
 | **systemd + linger** | User service with `Restart=on-failure` | Gateway crashes |
 | **Tray app** | Manual restart + status checks | Everything else |
 
-The tray app itself is pure PowerShell + WinForms — no build step, no dependencies, no admin rights (except the LAN proxy fix which needs to modify portproxy rules).
+The tray app itself is pure PowerShell + WinForms — no build step, no dependencies, no admin rights (except the LAN proxy fix which needs to modify portproxy rules). It is entirely event-driven: no timer, no background polling. Idle, it costs about 70 MB of private bytes.
+
+### Getting the memory back
+
+Keeping distros alive is the whole point of this tool, so it is worth being explicit about the cost: **every WSL2 distro shares one utility VM**, visible in Task Manager as a single `vmmemWSL` process. There is no per-distro process — the figure you see is the sum of everything running inside it.
+
+**Stop distro ▸** runs `wsl --terminate <distro>` on one distro and reports where `vmmemWSL` landed afterwards. Two things to expect:
+
+- The keepalive does **not** come back on its own. It only runs at logon, so the distro stays down until you re-run its `.vbs` in `launchers\` or log out and back in. This is intentional — a stop you have to undo deliberately is better than one that silently reverts.
+- If other distros are still running, the shared VM stays resident and releases pages lazily. The number will not drop by the stopped distro's full share right away.
+
+To cap the ceiling rather than reclaim after the fact, create `%USERPROFILE%\.wslconfig`:
+
+```ini
+[wsl2]
+memory=8GB
+autoMemoryReclaim=gradual
+sparseVhd=true
+```
+
+Requires `wsl --shutdown` to take effect, which stops every distro and kills the keepalives. Leave `processors` unset unless you have a reason — capping it throttles work in the distro without saving memory. Leave `networkingMode` at its NAT default; switching to `mirrored` breaks the `netsh portproxy` rules that `openclaw-lan-proxy.ps1` installs.
 
 ## Configuration
 

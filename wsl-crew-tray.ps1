@@ -40,6 +40,36 @@ function Notify($title, $text, $level) {
   Write-Log "$title - $text"
 }
 
+# Returns the running-distro list as one lowercase string, safe to -match against.
+#
+# wsl.exe emits UTF-16LE. Windows PowerShell 5.1 -- which is what launchers\wsl-crew-tray.vbs
+# starts this app with -- decodes that as NUL-interleaved text, so "kirocrew" arrives as
+# "k`0i`0r`0o`0c`0r`0e`0w" and a naive -match NEVER fires. That silently made the guard in
+# Repair-KiroCrew always believe the distro was down, so every click spawned another redundant
+# `sleep infinity` keepalive. Stripping NULs is a no-op if the output ever arrives clean.
+function Get-RunningDistros {
+  try {
+    $raw = (& wsl.exe --list --running 2>&1) -join ' '
+    return ($raw -replace "`0", '').ToLowerInvariant()
+  } catch {
+    Write-Log "Get-RunningDistros error: $($_.Exception.Message)"
+    return ''
+  }
+}
+
+function Test-DistroRunning($DistroName) {
+  return (Get-RunningDistros) -match [regex]::Escape($DistroName.ToLowerInvariant())
+}
+
+# Working set of the shared WSL2 utility VM, in MB, or $null if the VM is down.
+# All distros share ONE vmmemWSL process, so this is a whole-VM figure -- terminating one
+# distro of several will not drop it to zero.
+function Get-VmmemMB {
+  $p = Get-Process -Name 'vmmemWSL' -ErrorAction SilentlyContinue
+  if (-not $p) { return $null }
+  return [math]::Round((($p | Measure-Object -Property WorkingSet64 -Sum).Sum) / 1MB, 0)
+}
+
 # Probes the host Ollama from inside the distro. Returns "OK <ver> via <ip>" or "FAIL <reason>".
 # Calls a SCRIPT FILE in the distro on purpose: inlining the host-IP lookup here means embedded
 # quotes/backslashes get mangled crossing wsl.exe and bash dies -- which read as a false
@@ -161,8 +191,7 @@ function Repair-KiroCrew {
   Notify 'KiroCrew' 'Checking gateway...' 'Info'
   try {
     # Ensure distro is running
-    $running = (& wsl.exe --list --running) -join ' '
-    if ($running -notmatch $KiroCrewDistro) {
+    if (-not (Test-DistroRunning $KiroCrewDistro)) {
       Write-Log 'KiroCrew distro not running - launching keepalive'
       Start-Process wsl.exe -ArgumentList "-d $KiroCrewDistro -u $KiroCrewUser --exec /bin/sleep infinity" -WindowStyle Hidden
       Start-Sleep -Seconds 5
@@ -213,6 +242,67 @@ function Open-OpenClawDashboard {
   } catch { Notify 'OpenClaw error' $_.Exception.Message 'Error' }
 }
 
+# ---------- job 6: stop a distro ----------
+# Frees the memory a keepalive is deliberately holding. Confirms first: this kills the
+# distro's gateway, and the Startup keepalive does NOT come back on its own -- it only runs
+# at logon, so the distro stays down until you re-run the .vbs or log back in.
+function Stop-CrewDistro {
+  param(
+    [Parameter(Mandatory)][string]$DistroName,
+    [Parameter(Mandatory)][string]$Label
+  )
+
+  if (-not (Test-DistroRunning $DistroName)) {
+    Notify $Label "'$DistroName' is not running - nothing to stop." 'Info'
+    return
+  }
+
+  $answer = [System.Windows.Forms.MessageBox]::Show(
+    ("Stop the '$DistroName' distro?" + "`r`n`r`n" +
+     "This kills its gateway and any keepalive holding it open." + "`r`n`r`n" +
+     "It will NOT restart by itself - the keepalive only runs at logon. To bring it back, " +
+     "re-run its .vbs in launchers\ or log out and back in."),
+    "WSL Crew - Stop $Label",
+    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+    [System.Windows.Forms.MessageBoxIcon]::Warning)
+
+  if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
+    Write-Log "Stop $DistroName - cancelled at confirmation"
+    return
+  }
+
+  $before = Get-VmmemMB
+  Notify $Label "Stopping '$DistroName'..." 'Info'
+  try {
+    & wsl.exe --terminate $DistroName 2>&1 | Out-Null
+
+    # Give WSL a moment to tear the session down before re-checking. This reports the VM's
+    # CURRENT working set, not "memory freed" -- with other distros still up, the shared VM
+    # stays resident and only gives pages back as autoMemoryReclaim gets to them.
+    Start-Sleep -Seconds 3
+
+    if (Test-DistroRunning $DistroName) {
+      Notify "$Label still running" "'$DistroName' did not stop. Something may be re-launching it." 'Warning'
+      Write-Log "Stop $DistroName - FAILED, still in running list"
+      return
+    }
+
+    $after = Get-VmmemMB
+    if ($null -eq $after) {
+      $msg = 'stopped. No distros left - the WSL VM shut down, all of its memory is back.'
+    } elseif ($null -ne $before) {
+      $msg = "stopped. vmmemWSL now ${after} MB (was ${before} MB); other distros still running."
+    } else {
+      $msg = "stopped. vmmemWSL now ${after} MB."
+    }
+    Notify "$Label stopped" "'$DistroName' $msg" 'Info'
+    Write-Log "Stop $DistroName - OK; vmmemWSL before=$before MB after=$after MB"
+  } catch {
+    Notify "$Label stop error" $_.Exception.Message 'Error'
+    Write-Log "Stop $DistroName - error: $($_.Exception.Message)"
+  }
+}
+
 # ---------- menu ----------
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
@@ -226,6 +316,17 @@ $miOpenClaw.Add_Click({ Open-OpenClawDashboard })
 
 $miKiro = $menu.Items.Add('Restart KiroCrew gateway')
 $miKiro.Add_Click({ Repair-KiroCrew })
+
+# Stop distro -- submenu, one entry per supervised distro. Labels are refreshed on open
+# (see $menu.Add_Opening below) so you can see what is actually running before clicking.
+$miStop = New-Object System.Windows.Forms.ToolStripMenuItem('Stop distro')
+$miStopClaw = New-Object System.Windows.Forms.ToolStripMenuItem("OpenClaw ($OpenClawDistro)")
+$miStopClaw.Add_Click({ Stop-CrewDistro -DistroName $OpenClawDistro -Label 'OpenClaw' })
+$miStopKiro = New-Object System.Windows.Forms.ToolStripMenuItem("KiroCrew ($KiroCrewDistro)")
+$miStopKiro.Add_Click({ Stop-CrewDistro -DistroName $KiroCrewDistro -Label 'KiroCrew' })
+[void]$miStop.DropDownItems.Add($miStopClaw)
+[void]$miStop.DropDownItems.Add($miStopKiro)
+[void]$menu.Items.Add($miStop)
 
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
@@ -251,6 +352,28 @@ $miExit.Add_Click({
 })
 
 $icon.ContextMenuStrip = $menu
+
+# One `wsl --list --running` per menu open (not a background poll -- the app stays idle-free),
+# so the Stop entries show live state and grey out when there is nothing to stop.
+$menu.Add_Opening({
+  try {
+    $running = Get-RunningDistros
+    foreach ($pair in @(@($miStopClaw, $OpenClawDistro, 'OpenClaw'), @($miStopKiro, $KiroCrewDistro, 'KiroCrew'))) {
+      $item = $pair[0]; $name = $pair[1]; $label = $pair[2]
+      $isUp = $running -match [regex]::Escape($name.ToLowerInvariant())
+      $item.Text    = if ($isUp) { "$label ($name) - running" } else { "$label ($name) - stopped" }
+      $item.Enabled = $isUp
+    }
+    $miStop.Enabled = $miStopClaw.Enabled -or $miStopKiro.Enabled
+  } catch {
+    # Never let a probe failure block the menu from opening.
+    $miStop.Enabled = $true
+    $miStopClaw.Enabled = $true
+    $miStopKiro.Enabled = $true
+    Write-Log "menu Opening probe error: $($_.Exception.Message)"
+  }
+})
+
 $icon.Add_MouseDoubleClick({ Show-Status })
 
 Notify 'WSL Crew running' 'Right-click the tray icon for repairs.' 'Info'
