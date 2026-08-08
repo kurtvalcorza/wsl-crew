@@ -67,7 +67,29 @@ function Get-RunningDistros {
     Write-Log "Get-RunningDistros: wsl.exe exited $LASTEXITCODE"
     return $null
   }
-  return @(($raw -replace "`0", '') -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  # The unary comma is load-bearing. `return @(...)` enumerates into the pipeline, so an
+  # EMPTY array arrives at the caller as $null -- which would collapse "nothing is running"
+  # back into "unknown" and defeat the whole tristate below. Verified with zero distros up:
+  # `return @()` gives $null, `return ,@()` gives a real 0-count array.
+  return ,@(($raw -replace "`0", '') -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+# True when a `sleep infinity` keepalive already holds this distro open.
+# Asks the question the caller actually cares about -- does a keepalive exist -- by looking
+# at process command lines directly, so it stays correct even when the running-list probe
+# fails. The trailing space in the pattern keeps `-d rancher-desktop ` from matching
+# `-d rancher-desktop-data `.
+function Test-KeepaliveRunning($DistroName) {
+  try {
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name='wsl.exe'" -ErrorAction Stop |
+               Where-Object { $_.CommandLine -and
+                              $_.CommandLine -like "*-d $DistroName *" -and
+                              $_.CommandLine -like '*sleep infinity*' })
+    return ($procs.Count -gt 0)
+  } catch {
+    Write-Log "Test-KeepaliveRunning error: $($_.Exception.Message)"
+    return $false
+  }
 }
 
 # $true (running), $false (not running), or $null (could not determine).
@@ -104,6 +126,10 @@ function Get-VmmemInfo {
 # quotes/backslashes get mangled crossing wsl.exe and bash dies -- which read as a false
 # "UNREACHABLE" in an earlier version of this app.
 function Test-Ollama {
+  # `wsl -d <distro> ...` STARTS a stopped distro as a side effect. A read-only status check
+  # must not resurrect one the user deliberately stopped via Stop distro, so bail out first.
+  # Only a definite $false skips: on unknown we probe, preferring a stale answer to none.
+  if ((Test-DistroRunning $Distro) -eq $false) { return "SKIP $Distro-stopped" }
   try {
     $out = & wsl.exe -d $Distro -u $OpenClawUser -e bash -lc '$HOME/bin/ollama-probe' 2>&1
     $txt = ($out | Out-String).Trim()
@@ -154,6 +180,9 @@ function Repair-Ollama {
   try {
     # Step 1: is the host Ollama actually serving on a WSL-reachable address?
     # A stopped Ollama -- or one bound to 127.0.0.1 -- cannot be fixed by re-pointing baseUrl.
+    # Note a "SKIP" from Test-Ollama (distro stopped) falls through here on purpose: unlike
+    # the read-only status check, this is an explicit repair the user clicked, so step 2's
+    # `wsl -d` starting the distro is the intended outcome rather than an unwanted revival.
     if ((Test-Ollama) -notmatch '^OK') {
       $listening = @(Get-NetTCPConnection -LocalPort 11434 -State Listen -ErrorAction SilentlyContinue)
       $loopbackOnly = ($listening.Count -gt 0) -and
@@ -195,7 +224,9 @@ function Show-Status {
   $lines += if ($lan -eq '200') { 'LAN access   : OK' } else { "LAN access   : BROKEN (http $lan) - run Fix LAN access" }
 
   $probe = Test-Ollama
-  $lines += if ($probe -match '^OK') { "Local model  : OK ($probe)" } else { "Local model  : UNREACHABLE ($probe) - run Fix local model" }
+  $lines += if ($probe -match '^OK') { "Local model  : OK ($probe)" }
+            elseif ($probe -match '^SKIP') { "Local model  : not checked - '$Distro' is stopped" }
+            else { "Local model  : UNREACHABLE ($probe) - run Fix local model" }
 
   $kiro = Test-KiroCrew
   $lines += if ($kiro -eq 'OK') { "KiroCrew     : OK (port $KiroCrewPort)" } else { "KiroCrew     : $kiro - run Restart KiroCrew gateway" }
@@ -219,17 +250,18 @@ function Test-KiroCrew {
 function Repair-KiroCrew {
   Notify 'KiroCrew' 'Checking gateway...' 'Info'
   try {
-    # Ensure distro is running. Only launch the keepalive on a definite $false -- on an
-    # unknown ($null, probe failed) skip it, since the `wsl -d` call below starts the distro
-    # anyway and a redundant keepalive is exactly the leak this guard exists to prevent.
-    $kiroState = Test-DistroRunning $KiroCrewDistro
-    if ($null -eq $kiroState) {
-      Write-Log 'KiroCrew distro state unknown (probe failed) - skipping keepalive launch'
-    }
-    if ($kiroState -eq $false) {
-      Write-Log 'KiroCrew distro not running - launching keepalive'
+    # Ensure exactly one keepalive exists. Asking "is a keepalive present" rather than "is
+    # the distro running" is both idempotent and correct when the running-list probe fails:
+    # it never double-launches (the original bug), and never leaves the distro without one.
+    # A keepalive is required even when the distro is already up -- the one-shot `wsl -d`
+    # below would let WSL idle the utility VM down again once it returns, taking the gateway
+    # with it, which is exactly why launchers\kirocrew-keepalive.vbs exists.
+    if (-not (Test-KeepaliveRunning $KiroCrewDistro)) {
+      Write-Log 'KiroCrew keepalive not present - launching'
       Start-Process wsl.exe -ArgumentList "-d $KiroCrewDistro -u $KiroCrewUser --exec /bin/sleep infinity" -WindowStyle Hidden
       Start-Sleep -Seconds 5
+    } else {
+      Write-Log 'KiroCrew keepalive already present - not launching another'
     }
     # Restart the systemd user service (sets CWD to native path, avoids drvfs sandbox hang)
     & wsl.exe -d $KiroCrewDistro -u $KiroCrewUser -e bash -c "export XDG_RUNTIME_DIR=/run/user/$KiroCrewUid; rm -f /home/$KiroCrewUser/.kiro/crew/gateway.lock; systemctl --user restart kirocrew-gateway.service" 2>&1 | Out-Null
