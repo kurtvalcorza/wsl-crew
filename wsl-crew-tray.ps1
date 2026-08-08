@@ -141,6 +141,39 @@ function Test-KeepaliveRunning($DistroName) {
   return $null
 }
 
+# Ensures exactly one `sleep infinity` keepalive holds $DistroName open.
+# Returns 'launched', 'present', or 'unknown'.
+#
+# Every explicit repair needs this, not only KiroCrew's. A one-shot `wsl -d` starts a
+# stopped distro just for the duration of that command, and distro/fix-ollama-baseurl at
+# most restarts a systemd user service -- which launchers\openclaw-keepalive.vbs already
+# documents as insufficient, since WSL tears down the whole utility VM regardless of
+# lingering. Without this a repair can report success and then idle-shutdown behind it.
+#
+# Launching a keepalive also STARTS a stopped distro, so this may only be called from an
+# action the user explicitly asked for -- never from a read-only status check.
+function Start-KeepaliveIfMissing {
+  param(
+    [Parameter(Mandatory)][string]$DistroName,
+    [Parameter(Mandatory)][string]$User
+  )
+  $state = Test-KeepaliveRunning $DistroName
+  if ($null -eq $state) {
+    # Absence was never established. See Test-KeepaliveRunning for why unknown must not
+    # launch: a duplicate keepalive leaks a process until `wsl --shutdown`.
+    Write-Log "$DistroName keepalive state unknown after retry - not launching (fail safe)"
+    return 'unknown'
+  }
+  if ($state) {
+    Write-Log "$DistroName keepalive already present - not launching another"
+    return 'present'
+  }
+  Write-Log "$DistroName keepalive not present - launching"
+  Start-Process wsl.exe -ArgumentList "-d $DistroName -u $User --exec /bin/sleep infinity" -WindowStyle Hidden
+  Start-Sleep -Seconds 5
+  return 'launched'
+}
+
 # $true (running), $false (not running), or $null (could not determine).
 # Exact, case-insensitive name comparison -- see trap 3 above.
 function Test-DistroRunning($DistroName) {
@@ -254,16 +287,27 @@ function Repair-Ollama {
       }
     }
 
+    # Step 1b: step 2 below starts the distro if it is stopped, but nothing in it creates a
+    # keepalive -- fix-ollama-baseurl exits early when the config is already correct, and
+    # otherwise only restarts a systemd user service. Without a keepalive WSL would idle the
+    # utility VM back down shortly after this reports success. Safe to call here because
+    # the user explicitly clicked a repair.
+    $keepalive = Start-KeepaliveIfMissing -DistroName $Distro -User $OpenClawUser
+
     # Step 2: repair a drifted host IP in OpenClaw's config (no-op if unchanged).
     $out = & wsl.exe -d $Distro -u $OpenClawUser -e bash -lc '$HOME/bin/fix-ollama-baseurl' 2>&1
     $txt = ($out | Out-String).Trim()
     Write-Log "fix-ollama-baseurl output: $txt"
 
     # Step 3: report what is ACTUALLY true now, not what step 2 printed.
+    # A repair whose keepalive could not be confirmed may idle back down, so say so rather
+    # than reporting a bare success the user would reasonably read as durable.
+    $caveat = if ($keepalive -eq 'unknown') { " NOTE: could not confirm a keepalive for '$Distro', so it may idle-shutdown again - re-run this, or relaunch the keepalive from launchers\." } else { '' }
+
     $probe = Test-Ollama
     if ($probe -match '^OK') {
-      if ($txt -match 'updated baseUrl') { Notify 'Local model fixed' "baseUrl updated, gateway restarted. $probe" 'Info' }
-      else { Notify 'Local model OK' $probe 'Info' }
+      if ($txt -match 'updated baseUrl') { Notify 'Local model fixed' "baseUrl updated, gateway restarted. $probe$caveat" 'Info' }
+      else { Notify 'Local model OK' "$probe$caveat" 'Info' }
     } else {
       Notify 'Local model still unreachable' "$probe -- check that Ollama is running on Windows and OLLAMA_HOST=0.0.0.0" 'Warning'
     }
@@ -314,26 +358,14 @@ function Repair-KiroCrew {
     # A keepalive is required even when the distro is already up -- the one-shot `wsl -d`
     # below would let WSL idle the utility VM down again once it returns, taking the gateway
     # with it, which is exactly why launchers\kirocrew-keepalive.vbs exists.
-    # Launch ONLY on a definite $false. On $null the query failed twice and absence is not
-    # established -- fail safe and leave it alone. The asymmetry is deliberate: a keepalive
-    # wrongly skipped costs at most an idle-down that the next Restart click repairs, while
-    # a keepalive wrongly launched leaks a process that survives until `wsl --shutdown`.
-    $keepalive = Test-KeepaliveRunning $KiroCrewDistro
-    if ($keepalive -eq $false) {
-      Write-Log 'KiroCrew keepalive not present - launching'
-      Start-Process wsl.exe -ArgumentList "-d $KiroCrewDistro -u $KiroCrewUser --exec /bin/sleep infinity" -WindowStyle Hidden
-      Start-Sleep -Seconds 5
-    } elseif ($null -eq $keepalive) {
-      Write-Log 'KiroCrew keepalive state unknown after retry - not launching (fail safe)'
-    } else {
-      Write-Log 'KiroCrew keepalive already present - not launching another'
-    }
+    $keepalive = Start-KeepaliveIfMissing -DistroName $KiroCrewDistro -User $KiroCrewUser
     # Restart the systemd user service (sets CWD to native path, avoids drvfs sandbox hang)
     & wsl.exe -d $KiroCrewDistro -u $KiroCrewUser -e bash -c "export XDG_RUNTIME_DIR=/run/user/$KiroCrewUid; rm -f /home/$KiroCrewUser/.kiro/crew/gateway.lock; systemctl --user restart kirocrew-gateway.service" 2>&1 | Out-Null
     Start-Sleep -Seconds 12
+    $kiroCaveat = if ($keepalive -eq 'unknown') { " NOTE: could not confirm a keepalive for '$KiroCrewDistro', so it may idle-shutdown again." } else { '' }
     $probe = Test-KiroCrew
-    if ($probe -eq 'OK') { Notify 'KiroCrew OK' "Gateway listening on port $KiroCrewPort" 'Info' }
-    else { Notify 'KiroCrew still down' $probe 'Warning' }
+    if ($probe -eq 'OK') { Notify 'KiroCrew OK' "Gateway listening on port $KiroCrewPort$kiroCaveat" 'Info' }
+    else { Notify 'KiroCrew still down' "$probe$kiroCaveat" 'Warning' }
   } catch { Notify 'KiroCrew error' $_.Exception.Message 'Error' }
 }
 
