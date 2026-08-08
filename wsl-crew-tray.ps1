@@ -113,22 +113,32 @@ function Get-RunningDistros {
   return ,@($raw -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
 
-# True when a `sleep infinity` keepalive already holds this distro open.
-# Asks the question the caller actually cares about -- does a keepalive exist -- by looking
-# at process command lines directly, so it stays correct even when the running-list probe
+# $true (a keepalive exists), $false (none), or $null (could not determine).
+#
+# Asks the question the caller actually cares about -- does a keepalive exist -- by reading
+# process command lines directly, so it stays correct even when the running-list probe
 # fails. The trailing space in the pattern keeps `-d rancher-desktop ` from matching
 # `-d rancher-desktop-data `.
+#
+# The tristate is the same discipline Get-RunningDistros uses, and for the same reason: an
+# earlier version returned $false when the CIM query threw, so a transient WMI outage read
+# as "no keepalive" and every Restart click launched another `sleep infinity` -- precisely
+# the redundancy this helper exists to prevent. A failed query is retried once before the
+# answer is given up as unknown.
 function Test-KeepaliveRunning($DistroName) {
-  try {
-    $procs = @(Get-CimInstance Win32_Process -Filter "Name='wsl.exe'" -ErrorAction Stop |
-               Where-Object { $_.CommandLine -and
-                              $_.CommandLine -like "*-d $DistroName *" -and
-                              $_.CommandLine -like '*sleep infinity*' })
-    return ($procs.Count -gt 0)
-  } catch {
-    Write-Log "Test-KeepaliveRunning error: $($_.Exception.Message)"
-    return $false
+  foreach ($attempt in 1..2) {
+    try {
+      $procs = @(Get-CimInstance Win32_Process -Filter "Name='wsl.exe'" -ErrorAction Stop |
+                 Where-Object { $_.CommandLine -and
+                                $_.CommandLine -like "*-d $DistroName *" -and
+                                $_.CommandLine -like '*sleep infinity*' })
+      return ($procs.Count -gt 0)
+    } catch {
+      Write-Log "Test-KeepaliveRunning attempt $attempt failed: $($_.Exception.Message)"
+      if ($attempt -lt 2) { Start-Sleep -Seconds 1 }
+    }
   }
+  return $null
 }
 
 # $true (running), $false (not running), or $null (could not determine).
@@ -304,10 +314,17 @@ function Repair-KiroCrew {
     # A keepalive is required even when the distro is already up -- the one-shot `wsl -d`
     # below would let WSL idle the utility VM down again once it returns, taking the gateway
     # with it, which is exactly why launchers\kirocrew-keepalive.vbs exists.
-    if (-not (Test-KeepaliveRunning $KiroCrewDistro)) {
+    # Launch ONLY on a definite $false. On $null the query failed twice and absence is not
+    # established -- fail safe and leave it alone. The asymmetry is deliberate: a keepalive
+    # wrongly skipped costs at most an idle-down that the next Restart click repairs, while
+    # a keepalive wrongly launched leaks a process that survives until `wsl --shutdown`.
+    $keepalive = Test-KeepaliveRunning $KiroCrewDistro
+    if ($keepalive -eq $false) {
       Write-Log 'KiroCrew keepalive not present - launching'
       Start-Process wsl.exe -ArgumentList "-d $KiroCrewDistro -u $KiroCrewUser --exec /bin/sleep infinity" -WindowStyle Hidden
       Start-Sleep -Seconds 5
+    } elseif ($null -eq $keepalive) {
+      Write-Log 'KiroCrew keepalive state unknown after retry - not launching (fail safe)'
     } else {
       Write-Log 'KiroCrew keepalive already present - not launching another'
     }
