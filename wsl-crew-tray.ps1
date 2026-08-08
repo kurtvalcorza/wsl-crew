@@ -40,34 +40,63 @@ function Notify($title, $text, $level) {
   Write-Log "$title - $text"
 }
 
-# Returns the running-distro list as one lowercase string, safe to -match against.
+# Returns an ARRAY of exact running-distro names, or $null if the probe itself failed.
+# $null and @() are deliberately different: @() means "nothing is running", $null means "we
+# do not know". No caller may collapse the second into the first.
 #
-# wsl.exe emits UTF-16LE. Windows PowerShell 5.1 -- which is what launchers\wsl-crew-tray.vbs
-# starts this app with -- decodes that as NUL-interleaved text, so "kirocrew" arrives as
-# "k`0i`0r`0o`0c`0r`0e`0w" and a naive -match NEVER fires. That silently made the guard in
-# Repair-KiroCrew always believe the distro was down, so every click spawned another redundant
-# `sleep infinity` keepalive. Stripping NULs is a no-op if the output ever arrives clean.
+# Three traps this works around:
+#   1. wsl.exe emits UTF-16LE. Windows PowerShell 5.1 -- which is what
+#      launchers\wsl-crew-tray.vbs starts this app with -- decodes that as NUL-interleaved
+#      text, so "kirocrew" arrives as "k`0i`0r`0o`0c`0r`0e`0w" and a naive -match NEVER
+#      fires. That silently made the guard in Repair-KiroCrew always believe the distro was
+#      down, so every click spawned another redundant `sleep infinity` keepalive.
+#   2. wsl.exe signals failure through its exit code, NOT an exception, so a try/catch alone
+#      never sees it -- a failed probe would look like an empty list.
+#   3. Substring matching confuses distro names that share a prefix: `rancher-desktop` would
+#      read as running whenever only `rancher-desktop-data` is. Hence exact names, compared
+#      with -eq by callers, rather than one joined string.
 function Get-RunningDistros {
+  $raw = $null
   try {
-    $raw = (& wsl.exe --list --running 2>&1) -join ' '
-    return ($raw -replace "`0", '').ToLowerInvariant()
+    $raw = (& wsl.exe --list --running --quiet 2>&1 | Out-String)
   } catch {
-    Write-Log "Get-RunningDistros error: $($_.Exception.Message)"
-    return ''
+    Write-Log "Get-RunningDistros threw: $($_.Exception.Message)"
+    return $null
   }
+  if ($LASTEXITCODE -ne 0) {
+    Write-Log "Get-RunningDistros: wsl.exe exited $LASTEXITCODE"
+    return $null
+  }
+  return @(($raw -replace "`0", '') -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
 
+# $true (running), $false (not running), or $null (could not determine).
+# Exact, case-insensitive name comparison -- see trap 3 above.
 function Test-DistroRunning($DistroName) {
-  return (Get-RunningDistros) -match [regex]::Escape($DistroName.ToLowerInvariant())
+  $running = Get-RunningDistros
+  if ($null -eq $running) { return $null }
+  foreach ($d in $running) { if ($d -eq $DistroName) { return $true } }
+  return $false
 }
 
-# Working set of the shared WSL2 utility VM, in MB, or $null if the VM is down.
-# All distros share ONE vmmemWSL process, so this is a whole-VM figure -- terminating one
-# distro of several will not drop it to zero.
-function Get-VmmemMB {
+# Working set of the shared WSL2 utility VM. Every distro shares ONE process, so this is a
+# whole-VM figure -- terminating one distro of several will not drop it to zero.
+# Returns $null when no candidate process exists, otherwise an object with:
+#   MB    - working set in MB
+#   Exact - $true when the figure came from vmmemWSL, and so is unambiguously WSL's
+# Windows 11 names the process vmmemWSL; Windows 10, which the README still lists as
+# supported, names it vmmem. A bare `vmmem` may belong to some OTHER Hyper-V VM (Windows
+# Sandbox, WSA, a Docker VM), so a figure taken from it is reported as approximate rather
+# than presented as WSL's own.
+function Get-VmmemInfo {
+  $exact = $true
   $p = Get-Process -Name 'vmmemWSL' -ErrorAction SilentlyContinue
+  if (-not $p) { $exact = $false; $p = Get-Process -Name 'vmmem' -ErrorAction SilentlyContinue }
   if (-not $p) { return $null }
-  return [math]::Round((($p | Measure-Object -Property WorkingSet64 -Sum).Sum) / 1MB, 0)
+  return [pscustomobject]@{
+    MB    = [math]::Round((($p | Measure-Object -Property WorkingSet64 -Sum).Sum) / 1MB, 0)
+    Exact = $exact
+  }
 }
 
 # Probes the host Ollama from inside the distro. Returns "OK <ver> via <ip>" or "FAIL <reason>".
@@ -190,8 +219,14 @@ function Test-KiroCrew {
 function Repair-KiroCrew {
   Notify 'KiroCrew' 'Checking gateway...' 'Info'
   try {
-    # Ensure distro is running
-    if (-not (Test-DistroRunning $KiroCrewDistro)) {
+    # Ensure distro is running. Only launch the keepalive on a definite $false -- on an
+    # unknown ($null, probe failed) skip it, since the `wsl -d` call below starts the distro
+    # anyway and a redundant keepalive is exactly the leak this guard exists to prevent.
+    $kiroState = Test-DistroRunning $KiroCrewDistro
+    if ($null -eq $kiroState) {
+      Write-Log 'KiroCrew distro state unknown (probe failed) - skipping keepalive launch'
+    }
+    if ($kiroState -eq $false) {
       Write-Log 'KiroCrew distro not running - launching keepalive'
       Start-Process wsl.exe -ArgumentList "-d $KiroCrewDistro -u $KiroCrewUser --exec /bin/sleep infinity" -WindowStyle Hidden
       Start-Sleep -Seconds 5
@@ -252,9 +287,15 @@ function Stop-CrewDistro {
     [Parameter(Mandatory)][string]$Label
   )
 
-  if (-not (Test-DistroRunning $DistroName)) {
+  $state = Test-DistroRunning $DistroName
+  if ($state -eq $false) {
     Notify $Label "'$DistroName' is not running - nothing to stop." 'Info'
     return
+  }
+  if ($null -eq $state) {
+    # Probe failed. Fail open to the confirmation rather than refusing: --terminate on an
+    # already-stopped distro is harmless, and the user is about to be asked anyway.
+    Write-Log "Stop $DistroName - running-list probe failed; continuing to confirmation"
   }
 
   $answer = [System.Windows.Forms.MessageBox]::Show(
@@ -271,7 +312,7 @@ function Stop-CrewDistro {
     return
   }
 
-  $before = Get-VmmemMB
+  $before = Get-VmmemInfo
   Notify $Label "Stopping '$DistroName'..." 'Info'
   try {
     & wsl.exe --terminate $DistroName 2>&1 | Out-Null
@@ -281,22 +322,35 @@ function Stop-CrewDistro {
     # stays resident and only gives pages back as autoMemoryReclaim gets to them.
     Start-Sleep -Seconds 3
 
-    if (Test-DistroRunning $DistroName) {
+    $remaining = Get-RunningDistros
+    if ($null -eq $remaining) {
+      Notify "$Label - unconfirmed" "Sent the stop for '$DistroName', but could not read the running list to confirm it." 'Warning'
+      Write-Log "Stop $DistroName - terminate sent, post-check probe failed"
+      return
+    }
+    if ($remaining -contains $DistroName) {
       Notify "$Label still running" "'$DistroName' did not stop. Something may be re-launching it." 'Warning'
       Write-Log "Stop $DistroName - FAILED, still in running list"
       return
     }
 
-    $after = Get-VmmemMB
-    if ($null -eq $after) {
-      $msg = 'stopped. No distros left - the WSL VM shut down, all of its memory is back.'
-    } elseif ($null -ne $before) {
-      $msg = "stopped. vmmemWSL now ${after} MB (was ${before} MB); other distros still running."
+    # Whether the VM is gone is decided by the distro list, never by the absence of a process
+    # name -- on Windows 10 the process is called vmmem, so looking only for vmmemWSL there
+    # would wrongly announce that all memory had been returned while a distro was still up.
+    $after = Get-VmmemInfo
+    if ($remaining.Count -eq 0) {
+      $msg = 'stopped. No distros left - the WSL VM is shutting down, so all of its memory comes back.'
+    } elseif ($null -eq $after) {
+      $msg = "stopped. $($remaining.Count) distro(s) still running."
     } else {
-      $msg = "stopped. vmmemWSL now ${after} MB."
+      $qualifier = if ($after.Exact) { 'vmmemWSL' } else { 'vmmem (approximate - may include a non-WSL VM)' }
+      $was = if ($null -ne $before) { " (was $($before.MB) MB)" } else { '' }
+      $msg = "stopped. $qualifier now $($after.MB) MB${was}; $($remaining.Count) distro(s) still running."
     }
     Notify "$Label stopped" "'$DistroName' $msg" 'Info'
-    Write-Log "Stop $DistroName - OK; vmmemWSL before=$before MB after=$after MB"
+    Write-Log ("Stop $DistroName - OK; before=" + $(if ($null -ne $before) { "$($before.MB) MB" } else { 'n/a' }) +
+               " after=" + $(if ($null -ne $after) { "$($after.MB) MB" } else { 'n/a' }) +
+               " remaining=$($remaining.Count)")
   } catch {
     Notify "$Label stop error" $_.Exception.Message 'Error'
     Write-Log "Stop $DistroName - error: $($_.Exception.Message)"
@@ -360,9 +414,16 @@ $menu.Add_Opening({
     $running = Get-RunningDistros
     foreach ($pair in @(@($miStopClaw, $OpenClawDistro, 'OpenClaw'), @($miStopKiro, $KiroCrewDistro, 'KiroCrew'))) {
       $item = $pair[0]; $name = $pair[1]; $label = $pair[2]
-      $isUp = $running -match [regex]::Escape($name.ToLowerInvariant())
-      $item.Text    = if ($isUp) { "$label ($name) - running" } else { "$label ($name) - stopped" }
-      $item.Enabled = $isUp
+      if ($null -eq $running) {
+        # Probe failed -- state unknown. Fail open so the menu stays usable rather than
+        # presenting a stopped distro as authoritative fact.
+        $item.Text    = "$label ($name) - state unknown"
+        $item.Enabled = $true
+      } else {
+        $isUp = $running -contains $name
+        $item.Text    = if ($isUp) { "$label ($name) - running" } else { "$label ($name) - stopped" }
+        $item.Enabled = $isUp
+      }
     }
     $miStop.Enabled = $miStopClaw.Enabled -or $miStopKiro.Enabled
   } catch {

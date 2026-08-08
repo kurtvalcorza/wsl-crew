@@ -123,11 +123,21 @@ To cap the ceiling rather than reclaim after the fact, create `%USERPROFILE%\.ws
 ```ini
 [wsl2]
 memory=8GB
+
+# autoMemoryReclaim and sparseVhd belong under [experimental], NOT [wsl2].
+# Putting them in the section above produces no warning -- WSL just ignores them.
+[experimental]
 autoMemoryReclaim=gradual
 sparseVhd=true
 ```
 
-Requires `wsl --shutdown` to take effect, which stops every distro and kills the keepalives. Leave `processors` unset unless you have a reason — capping it throttles work in the distro without saving memory. Leave `networkingMode` at its NAT default; switching to `mirrored` breaks the `netsh portproxy` rules that `openclaw-lan-proxy.ps1` installs.
+Requires `wsl --shutdown` to take effect, which stops every distro and kills the keepalives.
+
+Three things worth knowing before you copy that:
+
+- **`autoMemoryReclaim` already defaults to `dropCache`**, which reclaims immediately. `gradual` is a deliberate *softening* — slower reclaim in exchange for better filesystem cache hit rates on repeated data loads. Omit the line if you want the more aggressive default.
+- **`sparseVhd` applies to newly created VHDs**; it does not retro-fit existing distros. Those need `wsl --manage <distro> --set-sparse true`.
+- Leave `processors` unset unless you have a reason — capping it throttles work in the distro without saving memory. Leave `networkingMode` at its NAT default; switching to `mirrored` breaks the `netsh portproxy` rules that `openclaw-lan-proxy.ps1` installs.
 
 ## Configuration
 
